@@ -36,6 +36,8 @@ Usage:
   molt search --q "..." [--type posts|comments|all] [--limit N]
   molt post --submolt <name> --title <t> [--content <text>|--content-file <path>|--url <u>]
   molt comment --post-id <id> --content <text> [--parent-id <cid>]
+  molt publish agentbox --memory-dir <dir> [--submolt <name>] [--title-prefix <text>] [--max-bytes N]
+  molt publish agentbox --mode comment --post-id <id> --memory-dir <dir> [--title-prefix <text>] [--max-bytes N]
   molt dm check
 
 Global options (can be provided before or after the command):
@@ -838,6 +840,147 @@ case "$cmd" in
     fi
     do_request "comment" "POST" "/comments" "$_body"
     rm -f "$_body"
+    ;;
+  publish)
+    if [ $# -lt 1 ]; then
+      err "error: missing publish subcommand"
+      json_error "publish_agentbox" "missing publish subcommand" "null"
+      exit 2
+    fi
+    subcmd="$1"
+    shift
+    case "$subcmd" in
+      agentbox)
+        OP="publish_agentbox"
+        SUBMOLT="general"
+        POST_ID=""
+        _mode="post"
+        _memory_dir=""
+        _title_prefix="Agentbox"
+        _max_bytes="8000"
+        while [ $# -gt 0 ]; do
+          if parse_global_flag "$1" "${2:-}"; then
+            shift "$GLOBAL_SHIFT"
+            continue
+          fi
+          case "$1" in
+            --memory-dir)
+              [ $# -ge 2 ] || { err "error: missing value for --memory-dir"; json_error "${OP}" "missing value for --memory-dir" "null"; exit 2; }
+              _memory_dir="$2"
+              shift 2
+              ;;
+            --submolt)
+              [ $# -ge 2 ] || { err "error: missing value for --submolt"; json_error "${OP}" "missing value for --submolt" "null"; exit 2; }
+              SUBMOLT="$2"
+              shift 2
+              ;;
+            --title-prefix)
+              [ $# -ge 2 ] || { err "error: missing value for --title-prefix"; json_error "${OP}" "missing value for --title-prefix" "null"; exit 2; }
+              _title_prefix="$2"
+              shift 2
+              ;;
+            --max-bytes)
+              [ $# -ge 2 ] || { err "error: missing value for --max-bytes"; json_error "${OP}" "missing value for --max-bytes" "null"; exit 2; }
+              _max_bytes="$2"
+              shift 2
+              ;;
+            --mode)
+              [ $# -ge 2 ] || { err "error: missing value for --mode"; json_error "${OP}" "missing value for --mode" "null"; exit 2; }
+              _mode="$2"
+              shift 2
+              ;;
+            --post-id)
+              [ $# -ge 2 ] || { err "error: missing value for --post-id"; json_error "${OP}" "missing value for --post-id" "null"; exit 2; }
+              POST_ID="$2"
+              shift 2
+              ;;
+            --help|-h)
+              usage
+              exit 0
+              ;;
+            *)
+              err "error: unexpected argument: $1"
+              json_error "${OP}" "unexpected argument" "null"
+              exit 2
+              ;;
+          esac
+        done
+
+        if [ -z "$_memory_dir" ]; then
+          err "error: missing --memory-dir"
+          json_error "${OP}" "missing --memory-dir" "null"
+          exit 2
+        fi
+
+        parse_int "--max-bytes" "$_max_bytes"
+
+        case "$_mode" in
+          post|comment) ;;
+          *)
+            err "error: invalid --mode (post|comment)"
+            json_error "${OP}" "invalid --mode" "null"
+            exit 2
+            ;;
+        esac
+
+        if [ "$_mode" = "post" ]; then
+          validate_segment "submolt" "$SUBMOLT"
+        else
+          if [ -z "$POST_ID" ]; then
+            err "error: --post-id is required for comment mode"
+            json_error "${OP}" "missing --post-id" "null"
+            exit 2
+          fi
+          validate_segment "post-id" "$POST_ID"
+        fi
+
+        _mem="$_memory_dir/MEMORY.md"
+        if [ ! -f "$_mem" ]; then
+          err "error: memory file not found: $_mem"
+          json_error "${OP}" "memory file not found" "null"
+          exit 2
+        fi
+
+        _updated=$(awk -F': ' '/^- Updated \(UTC\):/ {print $2; exit 0}' "$_mem")
+        if [ -z "$_updated" ]; then
+          _updated=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+        fi
+        _drift=$(awk -F': ' '/^- Drift:/ {print $2; exit 0}' "$_mem")
+        if [ -z "$_drift" ]; then
+          _drift="unknown"
+        fi
+        _title="${_title_prefix} ${_updated} — Drift=${_drift}"
+
+        _tmp_content=$(mktemp "${TMPDIR:-/tmp}/molt-content.XXXXXX")
+        awk 'NR==1, /^## Recent events/ {print}' "$_mem" > "$_tmp_content"
+        _size=$(wc -c < "$_tmp_content" | awk '{print $1}')
+        if [ "$_size" -gt "$_max_bytes" ]; then
+          _tmp_trim=$(mktemp "${TMPDIR:-/tmp}/molt-trim.XXXXXX")
+          dd if="$_tmp_content" of="$_tmp_trim" bs=1 count="$_max_bytes" 2>/dev/null
+          printf '\n(truncated)\n' >> "$_tmp_trim"
+          mv "$_tmp_trim" "$_tmp_content"
+        fi
+        _content=$(cat "$_tmp_content")
+        rm -f "$_tmp_content"
+
+        _body=$(mktemp "${TMPDIR:-/tmp}/molt-body.XXXXXX")
+        if [ "$_mode" = "comment" ]; then
+          jq -cn --arg post_id "$POST_ID" --arg content "$_content" \
+            '{post_id:$post_id, content:$content}' > "$_body"
+          do_request "publish_agentbox" "POST" "/comments" "$_body"
+        else
+          jq -cn --arg submolt "$SUBMOLT" --arg title "$_title" --arg content "$_content" \
+            '{submolt:$submolt, title:$title, content:$content}' > "$_body"
+          do_request "publish_agentbox" "POST" "/posts" "$_body"
+        fi
+        rm -f "$_body"
+        ;;
+      *)
+        err "error: unknown publish subcommand: $subcmd"
+        json_error "publish_agentbox" "unknown publish subcommand" "null"
+        exit 2
+        ;;
+    esac
     ;;
   dm)
     if [ $# -lt 1 ]; then
