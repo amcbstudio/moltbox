@@ -1,0 +1,78 @@
+#!/bin/sh
+set -eu
+
+out=""
+write_out=""
+status="${MOCK_CURL_STATUS:-200}"
+fixture="${MOCK_CURL_FIXTURE:-}"
+exit_code="${MOCK_CURL_EXIT:-0}"
+stderr_msg="${MOCK_CURL_STDERR:-}"
+
+for arg in "$@"; do
+  case "$arg" in
+    -L|--location)
+      if [ "${MOCK_CURL_FORBID_L:-}" = "1" ]; then
+        echo "redirect not allowed" >&2
+        exit 9
+      fi
+      ;;
+  esac
+done
+
+last=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o)
+      out="$2"
+      shift 2
+      ;;
+    -w|--write-out)
+      write_out="$2"
+      shift 2
+      ;;
+    -H|-X|-d|--data|--data-binary|--connect-timeout|--max-time|--max-redirs|--proto)
+      shift 2
+      ;;
+    --fail-with-body)
+      shift
+      ;;
+    -f|-s|-S|-fsS|-sfS|-sSf|-sS|-fs)
+      shift
+      ;;
+    --*)
+      shift
+      ;;
+    -* )
+      shift
+      ;;
+    *)
+      last="$1"
+      shift
+      ;;
+  esac
+done
+
+url="$last"
+
+if [ -n "${MOCK_CURL_EXPECT_URL:-}" ] && [ "$url" != "$MOCK_CURL_EXPECT_URL" ]; then
+  echo "url mismatch: $url" >&2
+  exit 7
+fi
+
+if [ -n "$stderr_msg" ]; then
+  echo "$stderr_msg" >&2
+fi
+
+if [ -n "$out" ]; then
+  if [ -n "$fixture" ]; then
+    cat "$fixture" > "$out"
+  else
+    : > "$out"
+  fi
+fi
+
+if [ -n "$write_out" ]; then
+  printf '%s' "$status"
+fi
+
+exit "$exit_code"

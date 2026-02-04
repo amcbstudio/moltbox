@@ -1,0 +1,885 @@
+#!/bin/sh
+set -eu
+
+BASE="https://www.moltbook.com/api/v1"
+CONNECT_TIMEOUT=10
+MAX_TIME=30
+
+API_KEY_FILE=""
+JSONL_EVENTS=""
+API_KEY=""
+
+OP=""
+SORT=""
+LIMIT=""
+SUBMOLT=""
+POST_ID=""
+COMMENT_ID=""
+QUERY=""
+NOTE=""
+
+hash_cmd=""
+
+err() {
+  printf '%s\n' "$*" >&2
+}
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  molt help
+  molt status
+  molt me
+  molt feed [--sort new|hot|top] [--limit N]
+  molt posts [--sort new|hot|top|rising] [--limit N]
+  molt subfeed <submolt> [--sort new|hot|top|rising] [--limit N]
+  molt search --q "..." [--type posts|comments|all] [--limit N]
+  molt post --submolt <name> --title <t> [--content <text>|--content-file <path>|--url <u>]
+  molt comment --post-id <id> --content <text> [--parent-id <cid>]
+  molt dm check
+
+Global options (can be provided before or after the command):
+  --api-key-file <path>
+  --jsonl-events <path>
+USAGE
+}
+
+json_error() {
+  _op="$1"
+  _msg="$2"
+  _http_status="${3:-null}"
+  _retry_seconds="${4:-}"
+  _retry_minutes="${5:-}"
+
+  jq -cn \
+    --arg type "error" \
+    --arg where "molt" \
+    --arg op "${_op}" \
+    --arg message "${_msg}" \
+    --argjson http_status "${_http_status}" \
+    --arg retry_seconds "${_retry_seconds}" \
+    --arg retry_minutes "${_retry_minutes}" \
+    '{
+      type: $type,
+      where: $where,
+      op: $op,
+      message: $message
+    }
+    | (if $http_status == null then . else . + {http_status:$http_status} end)
+    | (if $retry_seconds != "" then . + {retry_after_seconds:($retry_seconds|tonumber)} else . end)
+    | (if $retry_minutes != "" then . + {retry_after_minutes:($retry_minutes|tonumber)} else . end)'
+}
+
+write_event() {
+  [ -n "$JSONL_EVENTS" ] || return 0
+
+  ensure_hash_cmd
+
+  _ok="$1"
+  _http_status="$2"
+  _bytes="$3"
+  _sha256="$4"
+
+  _ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+  jq -cn \
+    --arg ts "${_ts}" \
+    --arg type "molt" \
+    --arg op "${OP}" \
+    --argjson ok "${_ok}" \
+    --argjson http_status "${_http_status}" \
+    --arg submolt "${SUBMOLT}" \
+    --arg post_id "${POST_ID}" \
+    --arg comment_id "${COMMENT_ID}" \
+    --arg query "${QUERY}" \
+    --argjson limit "${LIMIT:-null}" \
+    --arg sort "${SORT}" \
+    --argjson bytes "${_bytes}" \
+    --arg sha256 "${_sha256}" \
+    --arg note "${NOTE}" \
+    '{
+      ts:$ts,
+      type:$type,
+      op:$op,
+      ok:$ok,
+      http_status:$http_status,
+      bytes:$bytes,
+      sha256:$sha256
+    }
+    | (if $submolt != "" then . + {submolt:$submolt} else . end)
+    | (if $post_id != "" then . + {post_id:$post_id} else . end)
+    | (if $comment_id != "" then . + {comment_id:$comment_id} else . end)
+    | (if $query != "" then . + {query:$query} else . end)
+    | (if $limit != null then . + {limit:$limit} else . end)
+    | (if $sort != "" then . + {sort:$sort} else . end)
+    | (if $note != "" then . + {note:$note} else . end)' >> "$JSONL_EVENTS"
+}
+
+ensure_hash_cmd() {
+  if [ -n "$hash_cmd" ]; then
+    return 0
+  fi
+  if command -v sha256sum >/dev/null 2>&1; then
+    hash_cmd="sha256sum"
+    return 0
+  fi
+  if command -v shasum >/dev/null 2>&1; then
+    hash_cmd="shasum -a 256"
+    return 0
+  fi
+  err "error: sha256 tool not found (sha256sum or shasum -a 256 required for --jsonl-events)"
+  json_error "${OP:-usage}" "sha256 tool not found" "null"
+  exit 1
+}
+
+hash_file() {
+  _file="$1"
+  if [ -z "$hash_cmd" ]; then
+    ensure_hash_cmd
+  fi
+  if [ "$hash_cmd" = "sha256sum" ]; then
+    sha256sum "$_file" | awk '{print $1}'
+  else
+    shasum -a 256 "$_file" | awk '{print $1}'
+  fi
+}
+
+bytes_of() {
+  _file="$1"
+  if [ -f "$_file" ]; then
+    wc -c < "$_file" | awk '{print $1}'
+  else
+    printf '0'
+  fi
+}
+
+require_tools() {
+  if ! command -v curl >/dev/null 2>&1; then
+    err "error: curl not found"
+    json_error "${OP:-usage}" "curl not found" "null"
+    exit 1
+  fi
+  if ! command -v jq >/dev/null 2>&1; then
+    err "error: jq not found"
+    json_error "${OP:-usage}" "jq not found" "null"
+    exit 1
+  fi
+}
+
+urlencode() {
+  printf '%s' "$1" | jq -sRr @uri
+}
+
+validate_segment() {
+  _label="$1"
+  _val="$2"
+  case "$_val" in
+    "")
+      err "error: missing $_label"
+      json_error "${OP:-usage}" "missing $_label" "null"
+      exit 2
+      ;;
+    *[!A-Za-z0-9._-]* )
+      err "error: invalid $_label (allowed: A-Z a-z 0-9 . _ -)"
+      json_error "${OP:-usage}" "invalid $_label" "null"
+      exit 2
+      ;;
+  esac
+}
+
+require_api_key() {
+  if [ -z "$API_KEY" ]; then
+    if [ -n "$API_KEY_FILE" ]; then
+      if [ ! -f "$API_KEY_FILE" ]; then
+        err "error: api key file not found: $API_KEY_FILE"
+        json_error "${OP}" "api key file not found" "null"
+        if [ -n "$JSONL_EVENTS" ]; then
+          _empty_sha=$(hash_file /dev/null)
+          write_event false "null" 0 "$_empty_sha"
+        fi
+        exit 2
+      fi
+      API_KEY=$(sed -n '1p' "$API_KEY_FILE" | tr -d '\r\n')
+    elif [ -n "${MOLTBOOK_API_KEY:-}" ]; then
+      API_KEY="$MOLTBOOK_API_KEY"
+    fi
+  fi
+  if [ -z "$API_KEY" ]; then
+    err "error: missing API key (set MOLTBOOK_API_KEY or use --api-key-file)"
+    json_error "${OP}" "missing API key" "null"
+    if [ -n "$JSONL_EVENTS" ]; then
+      _empty_sha=$(hash_file /dev/null)
+      write_event false "null" 0 "$_empty_sha"
+    fi
+    exit 2
+  fi
+}
+
+append_query() {
+  _qs="$1"
+  _key="$2"
+  _val="$3"
+  if [ -z "$_val" ]; then
+    printf '%s' "$_qs"
+    return 0
+  fi
+  _enc=$(urlencode "$_val")
+  if [ -z "$_qs" ]; then
+    printf '?%s=%s' "$_key" "$_enc"
+  else
+    printf '%s&%s=%s' "$_qs" "$_key" "$_enc"
+  fi
+}
+
+parse_int() {
+  _label="$1"
+  _val="$2"
+  case "$_val" in
+    ""|*[!0-9]*)
+      err "error: invalid $_label (must be integer)"
+      json_error "${OP}" "invalid $_label" "null"
+      exit 2
+      ;;
+  esac
+}
+
+ensure_base_url() {
+  _path="$1"
+  case "$_path" in
+    /*) ;;
+    *)
+      err "error: invalid path"
+      json_error "${OP}" "invalid path" "null"
+      exit 2
+      ;;
+  esac
+  _url="${BASE}${_path}"
+  case "$_url" in
+    "$BASE"/*) ;;
+    *)
+      err "error: refusing non-base url"
+      json_error "${OP}" "refusing non-base url" "null"
+      exit 2
+      ;;
+  esac
+  printf '%s' "$_url"
+}
+
+supports_fail_with_body() {
+  set +e
+  curl --help 2>/dev/null | grep -q -- '--fail-with-body'
+  _rc=$?
+  set -e
+  return "$_rc"
+}
+
+do_request() {
+  OP="$1"
+  _method="$2"
+  _path="$3"
+  _body_file="${4:-}"
+
+  require_tools
+  require_api_key
+
+  _url=$(ensure_base_url "$_path")
+
+  _tmp_body=$(mktemp "${TMPDIR:-/tmp}/molt-body.XXXXXX")
+  _tmp_err=$(mktemp "${TMPDIR:-/tmp}/molt-err.XXXXXX")
+
+  _curl_args="-fsS --max-time ${MAX_TIME} --connect-timeout ${CONNECT_TIMEOUT}"
+  if supports_fail_with_body; then
+    _curl_args="${_curl_args} --fail-with-body"
+  fi
+
+  _http_code=""
+  _curl_rc=0
+
+  set +e
+  if [ "$_method" = "GET" ]; then
+    _http_code=$(curl $_curl_args \
+      -H "Authorization: Bearer ${API_KEY}" \
+      -o "${_tmp_body}" \
+      -w "%{http_code}" \
+      "${_url}" 2>"${_tmp_err}")
+    _curl_rc=$?
+  else
+    _http_code=$(curl $_curl_args \
+      -X "${_method}" \
+      -H "Authorization: Bearer ${API_KEY}" \
+      -H "Content-Type: application/json" \
+      --data-binary "@${_body_file}" \
+      -o "${_tmp_body}" \
+      -w "%{http_code}" \
+      "${_url}" 2>"${_tmp_err}")
+    _curl_rc=$?
+  fi
+  set -e
+
+  _bytes=$(bytes_of "${_tmp_body}")
+  _sha256=""
+  if [ -n "$JSONL_EVENTS" ]; then
+    _sha256=$(hash_file "${_tmp_body}")
+  fi
+
+  case "$_http_code" in
+    [0-9][0-9][0-9])
+      _http_status="$_http_code"
+      ;;
+    *)
+      _http_status="null"
+      ;;
+  esac
+
+  if [ "$_curl_rc" -ne 0 ]; then
+    if [ "$_http_status" != "null" ] && [ "$_http_code" -ge 400 ]; then
+      _retry_seconds=""
+      _retry_minutes=""
+      if [ "$_http_code" -eq 429 ] && [ -s "${_tmp_body}" ]; then
+        if jq -e . >/dev/null 2>&1 < "${_tmp_body}"; then
+          _retry_seconds=$(jq -r '.retry_after_seconds // empty' < "${_tmp_body}")
+          _retry_minutes=$(jq -r '.retry_after_minutes // empty' < "${_tmp_body}")
+        fi
+      fi
+
+      _msg="HTTP ${_http_code}"
+      json_error "${OP}" "${_msg}" "${_http_status}" "${_retry_seconds}" "${_retry_minutes}"
+      write_event false "${_http_status}" "${_bytes}" "${_sha256}"
+
+      rm -f "${_tmp_body}" "${_tmp_err}"
+      exit 1
+    fi
+
+    _msg=$(tr '\n' ' ' < "${_tmp_err}" | sed 's/[[:space:]]\+/ /g' | sed 's/^ *//;s/ *$//')
+    [ -n "$_msg" ] || _msg="curl failed"
+
+    json_error "${OP}" "$_msg" "${_http_status}"
+    write_event false "${_http_status}" "${_bytes}" "${_sha256}"
+
+    rm -f "${_tmp_body}" "${_tmp_err}"
+    exit 1
+  fi
+
+  if [ "$_http_code" -lt 200 ] || [ "$_http_code" -ge 300 ]; then
+    _retry_seconds=""
+    _retry_minutes=""
+    if [ "$_http_code" -eq 429 ] && [ -s "${_tmp_body}" ]; then
+      if jq -e . >/dev/null 2>&1 < "${_tmp_body}"; then
+        _retry_seconds=$(jq -r '.retry_after_seconds // empty' < "${_tmp_body}")
+        _retry_minutes=$(jq -r '.retry_after_minutes // empty' < "${_tmp_body}")
+      fi
+    fi
+
+    _msg="HTTP ${_http_code}"
+    json_error "${OP}" "${_msg}" "${_http_status}" "${_retry_seconds}" "${_retry_minutes}"
+    write_event false "${_http_status}" "${_bytes}" "${_sha256}"
+
+    rm -f "${_tmp_body}" "${_tmp_err}"
+    exit 1
+  fi
+
+  cat "${_tmp_body}"
+  write_event true "${_http_status}" "${_bytes}" "${_sha256}"
+
+  rm -f "${_tmp_body}" "${_tmp_err}"
+}
+
+GLOBAL_SHIFT=0
+parse_global_flag() {
+  GLOBAL_SHIFT=0
+  case "$1" in
+    --api-key-file)
+      [ -n "${2:-}" ] || { err "error: missing value for --api-key-file"; json_error "${OP:-usage}" "missing value for --api-key-file" "null"; exit 2; }
+      API_KEY_FILE="$2"
+      GLOBAL_SHIFT=2
+      return 0
+      ;;
+    --jsonl-events)
+      [ -n "${2:-}" ] || { err "error: missing value for --jsonl-events"; json_error "${OP:-usage}" "missing value for --jsonl-events" "null"; exit 2; }
+      JSONL_EVENTS="$2"
+      GLOBAL_SHIFT=2
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+# Parse global flags before command
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --api-key-file)
+      [ $# -ge 2 ] || { err "error: missing value for --api-key-file"; json_error "usage" "missing value for --api-key-file" "null"; exit 2; }
+      API_KEY_FILE="$2"
+      shift 2
+      ;;
+    --jsonl-events)
+      [ $# -ge 2 ] || { err "error: missing value for --jsonl-events"; json_error "usage" "missing value for --jsonl-events" "null"; exit 2; }
+      JSONL_EVENTS="$2"
+      shift 2
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+cmd="${1:-help}"
+if [ $# -gt 0 ]; then
+  shift
+fi
+
+case "$cmd" in
+  help|-h|--help)
+    usage
+    exit 0
+    ;;
+  status)
+    OP="status"
+    while [ $# -gt 0 ]; do
+      if parse_global_flag "$1" "${2:-}"; then
+        shift "$GLOBAL_SHIFT"
+        continue
+      fi
+      case "$1" in
+        --help|-h)
+          usage
+          exit 0
+          ;;
+        *)
+          err "error: unexpected argument: $1"
+          json_error "${OP}" "unexpected argument" "null"
+          exit 2
+          ;;
+      esac
+    done
+    do_request "status" "GET" "/agents/status"
+    ;;
+  me)
+    OP="me"
+    while [ $# -gt 0 ]; do
+      if parse_global_flag "$1" "${2:-}"; then
+        shift "$GLOBAL_SHIFT"
+        continue
+      fi
+      case "$1" in
+        --help|-h)
+          usage
+          exit 0
+          ;;
+        *)
+          err "error: unexpected argument: $1"
+          json_error "${OP}" "unexpected argument" "null"
+          exit 2
+          ;;
+      esac
+    done
+    do_request "me" "GET" "/agents/me"
+    ;;
+  feed)
+    OP="feed"
+    SORT=""
+    LIMIT=""
+    while [ $# -gt 0 ]; do
+      if parse_global_flag "$1" "${2:-}"; then
+        shift "$GLOBAL_SHIFT"
+        continue
+      fi
+      case "$1" in
+        --sort)
+          [ $# -ge 2 ] || { err "error: missing value for --sort"; json_error "${OP}" "missing value for --sort" "null"; exit 2; }
+          SORT="$2"
+          shift 2
+          ;;
+        --limit)
+          [ $# -ge 2 ] || { err "error: missing value for --limit"; json_error "${OP}" "missing value for --limit" "null"; exit 2; }
+          LIMIT="$2"
+          shift 2
+          ;;
+        --help|-h)
+          usage
+          exit 0
+          ;;
+        *)
+          err "error: unexpected argument: $1"
+          json_error "${OP}" "unexpected argument" "null"
+          exit 2
+          ;;
+      esac
+    done
+    if [ -n "$SORT" ]; then
+      case "$SORT" in
+        new|hot|top) ;;
+        *)
+          err "error: invalid --sort (new|hot|top)"
+          json_error "${OP}" "invalid --sort" "null"
+          exit 2
+          ;;
+      esac
+    fi
+    if [ -n "$LIMIT" ]; then
+      parse_int "--limit" "$LIMIT"
+    fi
+    _qs=""
+    _qs=$(append_query "$_qs" "sort" "$SORT")
+    _qs=$(append_query "$_qs" "limit" "$LIMIT")
+    do_request "feed" "GET" "/feed${_qs}"
+    ;;
+  posts)
+    OP="posts"
+    SORT=""
+    LIMIT=""
+    while [ $# -gt 0 ]; do
+      if parse_global_flag "$1" "${2:-}"; then
+        shift "$GLOBAL_SHIFT"
+        continue
+      fi
+      case "$1" in
+        --sort)
+          [ $# -ge 2 ] || { err "error: missing value for --sort"; json_error "${OP}" "missing value for --sort" "null"; exit 2; }
+          SORT="$2"
+          shift 2
+          ;;
+        --limit)
+          [ $# -ge 2 ] || { err "error: missing value for --limit"; json_error "${OP}" "missing value for --limit" "null"; exit 2; }
+          LIMIT="$2"
+          shift 2
+          ;;
+        --help|-h)
+          usage
+          exit 0
+          ;;
+        *)
+          err "error: unexpected argument: $1"
+          json_error "${OP}" "unexpected argument" "null"
+          exit 2
+          ;;
+      esac
+    done
+    if [ -n "$SORT" ]; then
+      case "$SORT" in
+        new|hot|top|rising) ;;
+        *)
+          err "error: invalid --sort (new|hot|top|rising)"
+          json_error "${OP}" "invalid --sort" "null"
+          exit 2
+          ;;
+      esac
+    fi
+    if [ -n "$LIMIT" ]; then
+      parse_int "--limit" "$LIMIT"
+    fi
+    _qs=""
+    _qs=$(append_query "$_qs" "sort" "$SORT")
+    _qs=$(append_query "$_qs" "limit" "$LIMIT")
+    do_request "posts" "GET" "/posts${_qs}"
+    ;;
+  subfeed)
+    OP="subfeed"
+    if [ $# -lt 1 ]; then
+      err "error: missing submolt"
+      json_error "${OP}" "missing submolt" "null"
+      exit 2
+    fi
+    SUBMOLT="$1"
+    shift
+    validate_segment "submolt" "$SUBMOLT"
+    SORT=""
+    LIMIT=""
+    while [ $# -gt 0 ]; do
+      if parse_global_flag "$1" "${2:-}"; then
+        shift "$GLOBAL_SHIFT"
+        continue
+      fi
+      case "$1" in
+        --sort)
+          [ $# -ge 2 ] || { err "error: missing value for --sort"; json_error "${OP}" "missing value for --sort" "null"; exit 2; }
+          SORT="$2"
+          shift 2
+          ;;
+        --limit)
+          [ $# -ge 2 ] || { err "error: missing value for --limit"; json_error "${OP}" "missing value for --limit" "null"; exit 2; }
+          LIMIT="$2"
+          shift 2
+          ;;
+        --help|-h)
+          usage
+          exit 0
+          ;;
+        *)
+          err "error: unexpected argument: $1"
+          json_error "${OP}" "unexpected argument" "null"
+          exit 2
+          ;;
+      esac
+    done
+    if [ -n "$SORT" ]; then
+      case "$SORT" in
+        new|hot|top|rising) ;;
+        *)
+          err "error: invalid --sort (new|hot|top|rising)"
+          json_error "${OP}" "invalid --sort" "null"
+          exit 2
+          ;;
+      esac
+    fi
+    if [ -n "$LIMIT" ]; then
+      parse_int "--limit" "$LIMIT"
+    fi
+    _qs=""
+    _qs=$(append_query "$_qs" "sort" "$SORT")
+    _qs=$(append_query "$_qs" "limit" "$LIMIT")
+    do_request "subfeed" "GET" "/submolts/${SUBMOLT}/feed${_qs}"
+    ;;
+  search)
+    OP="search"
+    QUERY=""
+    _type=""
+    LIMIT=""
+    while [ $# -gt 0 ]; do
+      if parse_global_flag "$1" "${2:-}"; then
+        shift "$GLOBAL_SHIFT"
+        continue
+      fi
+      case "$1" in
+        --q)
+          [ $# -ge 2 ] || { err "error: missing value for --q"; json_error "${OP}" "missing value for --q" "null"; exit 2; }
+          QUERY="$2"
+          shift 2
+          ;;
+        --type)
+          [ $# -ge 2 ] || { err "error: missing value for --type"; json_error "${OP}" "missing value for --type" "null"; exit 2; }
+          _type="$2"
+          shift 2
+          ;;
+        --limit)
+          [ $# -ge 2 ] || { err "error: missing value for --limit"; json_error "${OP}" "missing value for --limit" "null"; exit 2; }
+          LIMIT="$2"
+          shift 2
+          ;;
+        --help|-h)
+          usage
+          exit 0
+          ;;
+        *)
+          err "error: unexpected argument: $1"
+          json_error "${OP}" "unexpected argument" "null"
+          exit 2
+          ;;
+      esac
+    done
+    if [ -z "$QUERY" ]; then
+      err "error: missing --q"
+      json_error "${OP}" "missing --q" "null"
+      exit 2
+    fi
+    if [ -n "$_type" ]; then
+      case "$_type" in
+        posts|comments|all) ;;
+        *)
+          err "error: invalid --type (posts|comments|all)"
+          json_error "${OP}" "invalid --type" "null"
+          exit 2
+          ;;
+      esac
+    fi
+    if [ -n "$LIMIT" ]; then
+      parse_int "--limit" "$LIMIT"
+    fi
+    _qs=""
+    _qs=$(append_query "$_qs" "q" "$QUERY")
+    _qs=$(append_query "$_qs" "type" "$_type")
+    _qs=$(append_query "$_qs" "limit" "$LIMIT")
+    do_request "search" "GET" "/search${_qs}"
+    ;;
+  post)
+    OP="post"
+    SUBMOLT=""
+    _title=""
+    _content=""
+    _content_file=""
+    _url=""
+    while [ $# -gt 0 ]; do
+      if parse_global_flag "$1" "${2:-}"; then
+        shift "$GLOBAL_SHIFT"
+        continue
+      fi
+      case "$1" in
+        --submolt)
+          [ $# -ge 2 ] || { err "error: missing value for --submolt"; json_error "${OP}" "missing value for --submolt" "null"; exit 2; }
+          SUBMOLT="$2"
+          shift 2
+          ;;
+        --title)
+          [ $# -ge 2 ] || { err "error: missing value for --title"; json_error "${OP}" "missing value for --title" "null"; exit 2; }
+          _title="$2"
+          shift 2
+          ;;
+        --content)
+          [ $# -ge 2 ] || { err "error: missing value for --content"; json_error "${OP}" "missing value for --content" "null"; exit 2; }
+          _content="$2"
+          shift 2
+          ;;
+        --content-file)
+          [ $# -ge 2 ] || { err "error: missing value for --content-file"; json_error "${OP}" "missing value for --content-file" "null"; exit 2; }
+          _content_file="$2"
+          shift 2
+          ;;
+        --url)
+          [ $# -ge 2 ] || { err "error: missing value for --url"; json_error "${OP}" "missing value for --url" "null"; exit 2; }
+          _url="$2"
+          shift 2
+          ;;
+        --help|-h)
+          usage
+          exit 0
+          ;;
+        *)
+          err "error: unexpected argument: $1"
+          json_error "${OP}" "unexpected argument" "null"
+          exit 2
+          ;;
+      esac
+    done
+
+    if [ -z "$SUBMOLT" ] || [ -z "$_title" ]; then
+      err "error: --submolt and --title are required"
+      json_error "${OP}" "missing required fields" "null"
+      exit 2
+    fi
+    validate_segment "submolt" "$SUBMOLT"
+
+    _content_sources=0
+    if [ -n "$_content" ]; then _content_sources=$(( _content_sources + 1 )); fi
+    if [ -n "$_content_file" ]; then _content_sources=$(( _content_sources + 1 )); fi
+    if [ -n "$_url" ]; then _content_sources=$(( _content_sources + 1 )); fi
+
+    if [ "$_content_sources" -ne 1 ]; then
+      err "error: provide exactly one of --content, --content-file, or --url"
+      json_error "${OP}" "invalid content selection" "null"
+      exit 2
+    fi
+
+    if [ -n "$_content_file" ]; then
+      if [ ! -f "$_content_file" ]; then
+        err "error: content file not found: $_content_file"
+        json_error "${OP}" "content file not found" "null"
+        exit 2
+      fi
+      _content=$(cat "$_content_file")
+    fi
+
+    _body=$(mktemp "${TMPDIR:-/tmp}/molt-body.XXXXXX")
+    if [ -n "$_url" ]; then
+      jq -cn --arg submolt "$SUBMOLT" --arg title "$_title" --arg url "$_url" \
+        '{submolt:$submolt, title:$title, url:$url}' > "$_body"
+    else
+      jq -cn --arg submolt "$SUBMOLT" --arg title "$_title" --arg content "$_content" \
+        '{submolt:$submolt, title:$title, content:$content}' > "$_body"
+    fi
+
+    do_request "post" "POST" "/posts" "$_body"
+    rm -f "$_body"
+    ;;
+  comment)
+    OP="comment"
+    POST_ID=""
+    COMMENT_ID=""
+    _content=""
+    while [ $# -gt 0 ]; do
+      if parse_global_flag "$1" "${2:-}"; then
+        shift "$GLOBAL_SHIFT"
+        continue
+      fi
+      case "$1" in
+        --post-id)
+          [ $# -ge 2 ] || { err "error: missing value for --post-id"; json_error "${OP}" "missing value for --post-id" "null"; exit 2; }
+          POST_ID="$2"
+          shift 2
+          ;;
+        --parent-id)
+          [ $# -ge 2 ] || { err "error: missing value for --parent-id"; json_error "${OP}" "missing value for --parent-id" "null"; exit 2; }
+          COMMENT_ID="$2"
+          shift 2
+          ;;
+        --content)
+          [ $# -ge 2 ] || { err "error: missing value for --content"; json_error "${OP}" "missing value for --content" "null"; exit 2; }
+          _content="$2"
+          shift 2
+          ;;
+        --help|-h)
+          usage
+          exit 0
+          ;;
+        *)
+          err "error: unexpected argument: $1"
+          json_error "${OP}" "unexpected argument" "null"
+          exit 2
+          ;;
+      esac
+    done
+    if [ -z "$POST_ID" ] || [ -z "$_content" ]; then
+      err "error: --post-id and --content are required"
+      json_error "${OP}" "missing required fields" "null"
+      exit 2
+    fi
+    validate_segment "post-id" "$POST_ID"
+    if [ -n "$COMMENT_ID" ]; then
+      validate_segment "parent-id" "$COMMENT_ID"
+    fi
+    _body=$(mktemp "${TMPDIR:-/tmp}/molt-body.XXXXXX")
+    if [ -n "$COMMENT_ID" ]; then
+      jq -cn --arg post_id "$POST_ID" --arg content "$_content" --arg parent_id "$COMMENT_ID" \
+        '{post_id:$post_id, content:$content, parent_id:$parent_id}' > "$_body"
+    else
+      jq -cn --arg post_id "$POST_ID" --arg content "$_content" \
+        '{post_id:$post_id, content:$content}' > "$_body"
+    fi
+    do_request "comment" "POST" "/comments" "$_body"
+    rm -f "$_body"
+    ;;
+  dm)
+    if [ $# -lt 1 ]; then
+      err "error: missing dm subcommand"
+      json_error "dm_check" "missing dm subcommand" "null"
+      exit 2
+    fi
+    subcmd="$1"
+    shift
+    case "$subcmd" in
+      check)
+        OP="dm_check"
+        while [ $# -gt 0 ]; do
+          if parse_global_flag "$1" "${2:-}"; then
+            shift "$GLOBAL_SHIFT"
+            continue
+          fi
+          case "$1" in
+            --help|-h)
+              usage
+              exit 0
+              ;;
+            *)
+              err "error: unexpected argument: $1"
+              json_error "${OP}" "unexpected argument" "null"
+              exit 2
+              ;;
+          esac
+        done
+        do_request "dm_check" "GET" "/agents/dm/check"
+        ;;
+      *)
+        err "error: unknown dm subcommand: $subcmd"
+        json_error "dm_check" "unknown dm subcommand" "null"
+        exit 2
+        ;;
+    esac
+    ;;
+  *)
+    err "error: unknown command: $cmd"
+    json_error "usage" "unknown command" "null"
+    usage >&2
+    exit 2
+    ;;
+esac
